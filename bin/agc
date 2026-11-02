@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+import os
+import sys
+import pty
+import select
+import termios
+import tty
+import fcntl
+import signal
+import struct
+import re
+import shutil
+import errno
+import subprocess
+
+VERSION = "2.1.245"
+AGY_PATH = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
+
+CLAUDE_HELP = """Usage: agc [options] [command] [prompt]
+
+Claude Code (Antigravity Edition) - starts an interactive session by default, use -p/--print for non-interactive output
+
+Arguments:
+  prompt                                Your prompt
+
+Options:
+  --add-dir <directories...>            Additional directories to allow tool access to
+  --agent <agent>                       Agent for the current session
+  -c, --continue                        Continue the most recent conversation
+  -r, --resume <conversation_id>        Resume a conversation by session ID
+  --dangerously-skip-permissions        Bypass all permission checks
+  --effort <level>                      Effort level (low, medium, high, xhigh, max)
+  --mode <mode>                         Execution mode (accept-edits, auto, plan)
+  --model <model>                       Model for the current session
+  --no-grayscale                        Disable automatic grayscale UI filter
+  -p, --print                           Run a single prompt non-interactively
+  -i, --prompt-interactive             Run initial prompt interactively
+  -v, --version                         Output version number
+  -h, --help                            Show help
+
+Commands:
+  doctor                                Check connectivity and account status
+  mcp                                   Manage MCP servers
+  model                                 Show or select model
+  plugin                                Manage plugins
+  update                                Update underlying CLI
+"""
+
+TEXT_REPLACEMENTS = [
+    (re.compile(rb"Antigravity CLI 1\.[0-9]+\.[0-9]+"), f"Claude Code v{VERSION}".encode("utf-8")),
+    (re.compile(rb"Welcome to the Antigravity CLI\. You are currently not signed in\."), b"Welcome to Claude Code. Connecting to backend..."),
+    (re.compile(rb"Welcome to the Antigravity CLI\."), b"Welcome to Claude Code."),
+    (re.compile(rb"Welcome to the Antigravity CLI"), b"Welcome to Claude Code"),
+    (re.compile(rb"the Antigravity CLI"), b"Claude Code"),
+    (re.compile(rb"Antigravity CLI"), b"Claude Code"),
+    (re.compile(rb"Signing in\.\.\."), b"Checking connectivity..."),
+    (re.compile(rb"\(Google AI Pro\)"), b"(Claude Pro)"),
+    (re.compile(rb"Google AI Pro"), b"Claude Pro"),
+    (re.compile(rb"Antigravity"), b"Claude Code"),
+]
+
+def to_grayscale_fg(match):
+    r, g, b = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    gray = int(0.299 * r + 0.587 * g + 0.114 * b)
+    return f"\x1b[38;2;{gray};{gray};{gray}m".encode("ascii")
+
+def to_grayscale_bg(match):
+    r, g, b = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    gray = int(0.299 * r + 0.587 * g + 0.114 * b)
+    return f"\x1b[48;2;{gray};{gray};{gray}m".encode("ascii")
+
+def transform_stream(data, enable_grayscale=True):
+    for pattern, repl in TEXT_REPLACEMENTS:
+        data = pattern.sub(repl, data)
+    if enable_grayscale:
+        data = re.sub(rb"\x1b\[38;2;(\d+);(\d+);(\d+)m", to_grayscale_fg, data)
+        data = re.sub(rb"\x1b\[48;2;(\d+);(\d+);(\d+)m", to_grayscale_bg, data)
+    return data
+
+def sync_win_size(source_fd, target_fd):
+    try:
+        ws = fcntl.ioctl(source_fd, termios.TIOCGWINSZ, b"\x00" * 8)
+        fcntl.ioctl(target_fd, termios.TIOCSWINSZ, ws)
+    except OSError:
+        pass
+
+def parse_arguments(argv):
+    if len(argv) == 1:
+        return []
+    first = argv[1]
+    if first in ("-v", "--version", "version"):
+        print(f"Claude Code v{VERSION} (Antigravity Wrapper)")
+        sys.exit(0)
+    if first in ("-h", "--help", "help"):
+        print(CLAUDE_HELP)
+        sys.exit(0)
+    if first == "doctor":
+        print(f"Claude Code v{VERSION} System Check")
+        print(f"Backend binary: {AGY_PATH}")
+        if os.path.exists(AGY_PATH) and os.access(AGY_PATH, os.X_OK):
+            print("Backend status: OK")
+        else:
+            print("Backend status: Missing or not executable")
+        sys.exit(0)
+
+    forward_args = []
+    i = 1
+    pos_args = []
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-c", "--continue"):
+            forward_args.append("-c")
+        elif arg in ("-r", "--resume"):
+            i += 1
+            if i < len(argv):
+                forward_args.extend(["--conversation", argv[i]])
+        elif arg in ("-p", "--print"):
+            forward_args.append("-p")
+            i += 1
+            if i < len(argv):
+                forward_args.append(argv[i])
+        elif arg == "--dangerously-skip-permissions":
+            forward_args.append("--dangerously-skip-permissions")
+        elif arg in ("--effort", "--model", "--mode", "--agent", "--project"):
+            forward_args.append(arg)
+            i += 1
+            if i < len(argv):
+                forward_args.append(argv[i])
+        elif arg.startswith("-"):
+            forward_args.append(arg)
+        else:
+            pos_args.append(arg)
+        i += 1
+
+    if pos_args:
+        prompt_text = " ".join(pos_args)
+        if "-p" not in forward_args and "--print" not in forward_args:
+            forward_args.extend(["-i", prompt_text])
+        else:
+            forward_args.append(prompt_text)
+
+    return forward_args
+
+def run_pty_session(args, enable_grayscale=True):
+    if not os.path.exists(AGY_PATH):
+        sys.stderr.write(f"Error: Backend binary '{AGY_PATH}' not found.\n")
+        sys.exit(1)
+
+    cmd = [AGY_PATH] + args
+    master_fd, slave_fd = pty.openpty()
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+
+    is_tty = os.isatty(stdin_fd)
+    old_term = None
+
+    if is_tty:
+        sync_win_size(stdin_fd, slave_fd)
+        old_term = termios.tcgetattr(stdin_fd)
+
+    def handle_winch(signum, frame):
+        if is_tty:
+            sync_win_size(stdin_fd, slave_fd)
+
+    signal.signal(signal.SIGWINCH, handle_winch)
+
+    pid = os.fork()
+    if pid == 0:
+        os.close(master_fd)
+        os.setsid()
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+        os.dup2(slave_fd, 0)
+        os.dup2(slave_fd, 1)
+        os.dup2(slave_fd, 2)
+        if slave_fd > 2:
+            os.close(slave_fd)
+        os.environ["CLAUDE_CODE"] = "1"
+        os.environ["TERM"] = os.environ.get("TERM", "xterm-256color")
+        try:
+            os.execv(AGY_PATH, cmd)
+        except Exception as e:
+            sys.stderr.write(f"Execution failed: {e}\n")
+            os._exit(1)
+
+    os.close(slave_fd)
+
+    try:
+        if is_tty:
+            tty.setraw(stdin_fd)
+
+        while True:
+            rlist, _, _ = select.select([master_fd, stdin_fd], [], [])
+            if master_fd in rlist:
+                try:
+                    data = os.read(master_fd, 8192)
+                except OSError as e:
+                    if e.errno == errno.EIO:
+                        break
+                    raise
+                if not data:
+                    break
+                transformed = transform_stream(data, enable_grayscale=enable_grayscale)
+                os.write(stdout_fd, transformed)
+
+            if stdin_fd in rlist:
+                try:
+                    user_input = os.read(stdin_fd, 4096)
+                except OSError:
+                    break
+                if not user_input:
+                    break
+                os.write(master_fd, user_input)
+    finally:
+        if is_tty and old_term:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term)
+        os.close(master_fd)
+        _, status = os.waitpid(pid, 0)
+        exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
+        sys.exit(exit_code)
+
+def main():
+    enable_grayscale = True
+    raw_argv = sys.argv[:]
+    if "--no-grayscale" in raw_argv:
+        enable_grayscale = False
+        raw_argv.remove("--no-grayscale")
+
+    args = parse_arguments(raw_argv)
+    if "-p" in args or "--print" in args:
+        cmd = [AGY_PATH] + args
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate()
+        if out:
+            sys.stdout.buffer.write(transform_stream(out, enable_grayscale=enable_grayscale))
+        if err:
+            sys.stderr.buffer.write(transform_stream(err, enable_grayscale=enable_grayscale))
+        sys.exit(proc.returncode)
+    else:
+        run_pty_session(args, enable_grayscale=enable_grayscale)
+
+if __name__ == "__main__":
+    main()
