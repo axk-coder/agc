@@ -1,52 +1,43 @@
 # agc
 
-A Claude Code terminal wrapper for Antigravity CLI.
+A graphical desktop interface for Antigravity CLI styled after the Claude desktop application.
 
 ## Overview
 
-agc wraps the Antigravity CLI (agy) to provide Anthropic's Claude Code visual styling, command conventions, and grayscale interface while maintaining full underlying Antigravity features. Both agy and agc remain independently available.
+agc provides a native Linux graphical desktop interface for the Antigravity CLI (agy). It replicates the layout, sidebar, typography, color palette, and styling of the Claude app while interfacing directly with Antigravity backend data and conversations. Both agy and agc remain independently available.
 
 ## Features
 
-- Preserves original agy binary intact.
-- Seamless Claude Code styling and presentation.
-- Automatic grayscale ANSI filter for clean interface aesthetic.
-- Argument compatibility for Claude Code CLI flags (-c, -p, prompt arguments, resume).
-- Full PTY multiplexing with dynamic window resize forwarding.
+- Native GTK WebKit2 desktop window with automatic fallback to Chrome application mode.
+- Claude-styled editorial layout with terracotta star asterisk, time-of-day greeting, and floating prompt card.
+- Real Antigravity conversation history loaded dynamically from conversation_summaries.db.
+- Active chat view with message rendering, syntax-highlighted code blocks, and tool execution status.
+- Strict security design: loopback binding only (127.0.0.1), UUID path traversal prevention, and shell-less subprocess execution.
+- Original agy CLI binary remains untouched.
 
 ## Usage
 
-Interactive mode:
+Launch the graphical interface:
 ```bash
 agc
 ```
 
-Interactive mode with initial prompt:
+Run in terminal CLI mode:
 ```bash
-agc "review this repository"
+agc --cli
 ```
 
-Continue previous conversation:
-```bash
-agc -c
-```
-
-Resume specific session:
-```bash
-agc -r <conversation-id>
-```
-
-Non-interactive print mode:
-```bash
-agc -p "generate a quick sort in python"
-```
-
-Standard Antigravity CLI remains untouched:
+Original Antigravity CLI remains untouched:
 ```bash
 agy
 ```
 
 ## Credits
 
-- Anthropic (Claude Code CLI interface design and architecture)
-- Google DeepMind (Antigravity CLI and Gemini models)
+- Anthropic (Claude App interface design and aesthetic)
+- Google DeepMind (Antigravity CLI backend engine)
+
+## Policies
+
+- Privacy Policy: All queries and transcript histories run locally on your device.
+- Terms of Service: Distributed under the MIT license.
