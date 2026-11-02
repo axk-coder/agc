@@ -1,6 +1,18 @@
 document.addEventListener("DOMContentLoaded", () => {
   let currentConversationId = null;
   let activeModel = "Gemini 3.8 Flash (Medium)";
+  let availableModels = [
+    "Gemini 3.8 Flash (Medium)",
+    "Gemini 3.8 Flash (High)",
+    "Gemini 3.8 Flash (Low)",
+    "Gemini 4 Argon (Medium)",
+    "Gemini 4 Argon (High)",
+    "Claude Sonnet 5.5 (Medium)",
+    "Claude Sonnet 5.5 (High)",
+    "Claude Opus 5.5 (Medium)",
+    "Claude Opus 5.5 (High)",
+    "GPT-OSS 120B (Medium)"
+  ];
 
   const sidebar = document.getElementById("sidebar");
   const sidebarToggle = document.getElementById("sidebarToggle");
@@ -13,6 +25,8 @@ document.addEventListener("DOMContentLoaded", () => {
   const currentChatTitle = document.getElementById("currentChatTitle");
   const greetingText = document.getElementById("greetingText");
   const activeModelLabel = document.getElementById("activeModelLabel");
+  const modelSelectorBadge = document.getElementById("modelSelectorBadge");
+  const modelDropdownMenu = document.getElementById("modelDropdownMenu");
   const welcomePromptInput = document.getElementById("welcomePromptInput");
   const chatPromptInput = document.getElementById("chatPromptInput");
   const welcomeSendBtn = document.getElementById("welcomeSendBtn");
@@ -45,15 +59,59 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  function renderModelDropdown() {
+    if (!modelDropdownMenu) return;
+    modelDropdownMenu.innerHTML = "";
+    availableModels.forEach(modelName => {
+      const opt = document.createElement("div");
+      opt.className = "model-option";
+      if (modelName === activeModel) {
+        opt.classList.add("selected");
+      }
+      opt.textContent = modelName;
+      opt.addEventListener("click", (e) => {
+        e.stopPropagation();
+        selectModel(modelName);
+      });
+      modelDropdownMenu.appendChild(opt);
+    });
+  }
+
+  function selectModel(modelName) {
+    activeModel = modelName;
+    if (activeModelLabel) activeModelLabel.textContent = activeModel;
+    if (modelDropdownMenu) modelDropdownMenu.style.display = "none";
+    renderModelDropdown();
+  }
+
+  if (modelSelectorBadge && modelDropdownMenu) {
+    modelSelectorBadge.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const isVisible = modelDropdownMenu.style.display === "flex";
+      modelDropdownMenu.style.display = isVisible ? "none" : "flex";
+      renderModelDropdown();
+    });
+
+    document.addEventListener("click", (e) => {
+      if (!modelSelectorBadge.contains(e.target) && !modelDropdownMenu.contains(e.target)) {
+        modelDropdownMenu.style.display = "none";
+      }
+    });
+  }
+
   async function loadStatus() {
     try {
       const res = await fetch("/api/status");
       if (res.ok) {
         const data = await res.json();
+        if (data.models && Array.isArray(data.models)) {
+          availableModels = data.models;
+        }
         if (data.model) {
           activeModel = data.model;
           if (activeModelLabel) activeModelLabel.textContent = activeModel;
         }
+        renderModelDropdown();
       }
     } catch (e) {}
   }
@@ -68,12 +126,22 @@ document.addEventListener("DOMContentLoaded", () => {
       list.forEach(item => {
         const div = document.createElement("div");
         div.className = "chat-item";
-        div.textContent = item.title || "Untitled chat";
         div.title = item.title;
         div.dataset.id = item.id;
         if (item.id === currentConversationId) {
           div.classList.add("active");
         }
+
+        const dot = document.createElement("span");
+        dot.className = "chat-dot";
+
+        const text = document.createElement("span");
+        text.className = "chat-text";
+        text.textContent = item.title || "Untitled chat";
+
+        div.appendChild(dot);
+        div.appendChild(text);
+
         div.addEventListener("click", () => {
           loadConversation(item.id, item.title);
         });
@@ -198,6 +266,7 @@ document.addEventListener("DOMContentLoaded", () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           prompt: cleanText,
+          model: activeModel,
           conversation_id: currentConversationId
         })
       });
@@ -210,7 +279,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let accumulated = "";
-      assistantBody.innerHTML = "";
+      let hasStarted = false;
 
       while (true) {
         const { value, done } = await reader.read();
@@ -218,6 +287,9 @@ document.addEventListener("DOMContentLoaded", () => {
         const chunk = decoder.decode(value, { stream: true });
         const lines = chunk.split("\n");
         for (const line of lines) {
+          if (line.startsWith(":")) {
+            continue;
+          }
           if (line.startsWith("data: ")) {
             const dataStr = line.slice(6).trim();
             if (dataStr === "[DONE]") {
@@ -225,7 +297,14 @@ document.addEventListener("DOMContentLoaded", () => {
             }
             try {
               const parsed = JSON.parse(dataStr);
+              if (parsed.status === "starting") {
+                continue;
+              }
               if (parsed.text) {
+                if (!hasStarted) {
+                  hasStarted = true;
+                  assistantBody.innerHTML = "";
+                }
                 accumulated += parsed.text;
                 assistantBody.innerHTML = formatMarkdown(accumulated);
                 chatMessages.scrollTop = chatMessages.scrollHeight;

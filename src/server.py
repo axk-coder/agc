@@ -6,16 +6,31 @@ import re
 import shutil
 import subprocess
 import threading
+import select
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 DB_PATH = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
 BRAIN_DIR = os.path.expanduser("~/.gemini/antigravity-cli/brain")
 AGY_PATH = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
 UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+MODEL_PATTERN = re.compile(r"^[a-zA-Z0-9\.\-\(\) ]{2,60}$")
 
-def get_conversations(limit=40):
+AVAILABLE_MODELS = [
+    "Gemini 3.8 Flash (Medium)",
+    "Gemini 3.8 Flash (High)",
+    "Gemini 3.8 Flash (Low)",
+    "Gemini 4 Argon (Medium)",
+    "Gemini 4 Argon (High)",
+    "Claude Sonnet 5.5 (Medium)",
+    "Claude Sonnet 5.5 (High)",
+    "Claude Opus 5.5 (Medium)",
+    "Claude Opus 5.5 (High)",
+    "GPT-OSS 120B (Medium)"
+]
+
+def get_conversations(limit=50):
     if not os.path.exists(DB_PATH):
         return []
     try:
@@ -30,7 +45,7 @@ def get_conversations(limit=40):
         """
         rows = cursor.execute(query, (limit,)).fetchall()
         conn.close()
-        return [{"id": r[0], "title": r[1], "time": r[2], "steps": r[3]} for r in rows]
+        return [{"id": r[0], "title": r[1].strip(), "time": r[2], "steps": r[3]} for r in rows]
     except Exception:
         return []
 
@@ -97,12 +112,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 "user": "axk",
                 "plan": "Free",
                 "model": "Gemini 3.8 Flash (Medium)",
-                "models": [
-                    "Gemini 3.8 Flash (Medium)",
-                    "Gemini 3.5 Pro",
-                    "Gemini 3.8 Flash-Lite",
-                    "Claude 3.7 Sonnet (Simulated Style)"
-                ],
+                "models": AVAILABLE_MODELS,
                 "backend": AGY_PATH,
                 "cwd": os.getcwd()
             }
@@ -202,6 +212,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
         prompt = payload.get("prompt", "").strip()
         conv_id = payload.get("conversation_id", "").strip()
+        model = payload.get("model", "").strip()
         if not prompt:
             self.send_response(400)
             self.end_headers()
@@ -210,33 +221,59 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
         self.send_cors()
         self.end_headers()
+        self.wfile.write(b": keepalive\n\n")
+        self.wfile.write(b'data: {"status": "starting"}\n\n')
+        self.wfile.flush()
 
         cmd = [AGY_PATH, "-p", prompt, "--dangerously-skip-permissions"]
+        if model and MODEL_PATTERN.match(model):
+            cmd.extend(["--model", model])
         if conv_id and UUID_PATTERN.match(conv_id):
             cmd.extend(["--conversation", conv_id])
 
         try:
             proc = subprocess.Popen(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1
+                bufsize=0
             )
-            for line in proc.stdout:
-                if line:
-                    event = f"data: {json.dumps({'text': line})}\n\n"
-                    self.wfile.write(event.encode("utf-8"))
+
+            stdout_fd = proc.stdout.fileno()
+
+            while proc.poll() is None:
+                rlist, _, _ = select.select([stdout_fd], [], [], 1.0)
+                if stdout_fd in rlist:
+                    chunk = os.read(stdout_fd, 4096)
+                    if chunk:
+                        text = chunk.decode("utf-8", errors="replace")
+                        event = f"data: {json.dumps({'text': text})}\n\n"
+                        self.wfile.write(event.encode("utf-8"))
+                        self.wfile.flush()
+                else:
+                    self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
-            proc.wait()
+
+            remainder = proc.stdout.read()
+            if remainder:
+                text = remainder.decode("utf-8", errors="replace")
+                event = f"data: {json.dumps({'text': text})}\n\n"
+                self.wfile.write(event.encode("utf-8"))
+                self.wfile.flush()
+
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except Exception as e:
             err_event = f"data: {json.dumps({'error': str(e)})}\n\n"
-            self.wfile.write(err_event.encode("utf-8"))
-            self.wfile.flush()
+            try:
+                self.wfile.write(err_event.encode("utf-8"))
+                self.wfile.flush()
+            except Exception:
+                pass
 
 def start_server(port=0):
     server = ThreadingHTTPServer(("127.0.0.1", port), AppHandler)
